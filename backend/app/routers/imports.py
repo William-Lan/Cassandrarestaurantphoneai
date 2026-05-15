@@ -5,7 +5,7 @@ from datetime import datetime
 from ..database import get_db, SessionLocal
 from ..models import ImportRecord, InventoryItem, InventoryTransaction, TransactionType, Supplier
 from ..schemas import ImportConfirm, ImportedPurchaseLine
-from ..services.ai_service import parse_file_for_purchases, match_items_to_inventory
+from ..services.ai_service import parse_and_match_file
 
 router = APIRouter(prefix="/import", tags=["import"])
 
@@ -56,8 +56,7 @@ def _process_import(import_id: int, content: bytes, filename: str, mime_type: st
         if not record:
             return
         try:
-            lines = parse_file_for_purchases(content, filename, mime_type)
-            lines = match_items_to_inventory(lines, db)
+            lines = parse_and_match_file(content, filename, mime_type, db)
 
             suppliers = list({l.get("supplier") for l in lines if l.get("supplier")})
             dates = sorted([l.get("date") for l in lines if l.get("date")])
