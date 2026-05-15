@@ -1,87 +1,119 @@
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from typing import List
 from datetime import datetime
-import json
 
-from ..database import get_db
-from ..models import (
-    ImportRecord, InventoryItem, InventoryTransaction,
-    TransactionType, Supplier,
-)
-from ..schemas import ImportPreview, ImportedPurchaseLine, ImportConfirm
+from ..database import get_db, SessionLocal
+from ..models import ImportRecord, InventoryItem, InventoryTransaction, TransactionType, Supplier
+from ..schemas import ImportConfirm, ImportedPurchaseLine
 from ..services.ai_service import parse_file_for_purchases, match_items_to_inventory
 
 router = APIRouter(prefix="/import", tags=["import"])
 
-ALLOWED_MIME_TYPES = {
-    "text/csv",
-    "application/vnd.ms-excel",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/pdf",
-    "image/png",
-    "image/jpeg",
-    "image/jpg",
-    "text/plain",
-}
+MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
-@router.post("/upload", response_model=ImportPreview)
+@router.post("/upload")
 async def upload_file(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    """Upload any supplier invoice/receipt. Claude extracts and matches the data."""
+    """Accept any supplier invoice/receipt, return immediately, process in background."""
     content = await file.read()
-    mime = file.content_type or "application/octet-stream"
+
+    if len(content) > MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File is {len(content) // 1024 // 1024}MB — max allowed is 25MB. "
+                   "Try splitting the file into smaller date ranges.",
+        )
 
     record = ImportRecord(
         filename=file.filename,
-        file_type=mime,
+        file_type=file.content_type or "application/octet-stream",
         status="processing",
     )
     db.add(record)
     db.commit()
     db.refresh(record)
 
+    background_tasks.add_task(
+        _process_import,
+        record.id,
+        content,
+        file.filename,
+        file.content_type or "application/octet-stream",
+    )
+
+    return {"import_id": record.id, "status": "processing", "filename": file.filename}
+
+
+def _process_import(import_id: int, content: bytes, filename: str, mime_type: str):
+    """Background task — runs Claude, updates ImportRecord when done."""
+    db = SessionLocal()
     try:
-        lines = parse_file_for_purchases(content, file.filename, mime)
-        lines = match_items_to_inventory(lines, db)
+        record = db.query(ImportRecord).filter(ImportRecord.id == import_id).first()
+        if not record:
+            return
+        try:
+            lines = parse_file_for_purchases(content, filename, mime_type)
+            lines = match_items_to_inventory(lines, db)
 
-        # Detect supplier and date range from extracted lines
-        suppliers = list({l.get("supplier") for l in lines if l.get("supplier")})
-        dates = sorted([l.get("date") for l in lines if l.get("date")])
-        date_range = None
-        if dates:
-            date_range = f"{dates[0]} — {dates[-1]}" if dates[0] != dates[-1] else dates[0]
+            suppliers = list({l.get("supplier") for l in lines if l.get("supplier")})
+            dates = sorted([l.get("date") for l in lines if l.get("date")])
+            date_range = None
+            if dates:
+                date_range = f"{dates[0]} — {dates[-1]}" if dates[0] != dates[-1] else dates[0]
 
-        unmatched = [l["item_name"] for l in lines if not l.get("matched_inventory_id")]
+            record.rows_extracted = len(lines)
+            record.supplier_name = suppliers[0] if suppliers else None
+            record.extracted_data = {
+                "lines": lines,
+                "supplier_detected": suppliers[0] if suppliers else None,
+                "date_range": date_range,
+                "unmatched_items": [l["item_name"] for l in lines if not l.get("matched_inventory_id")],
+            }
+            record.status = "pending_review"
+        except Exception as exc:
+            record.status = "error"
+            record.error_message = str(exc)
 
-        record.rows_extracted = len(lines)
-        record.extracted_data = lines
-        record.supplier_name = suppliers[0] if suppliers else None
-        record.status = "pending_review"
         db.commit()
+    finally:
+        db.close()
 
-        return ImportPreview(
-            import_id=record.id,
-            filename=file.filename,
-            supplier_detected=suppliers[0] if suppliers else None,
-            date_range=date_range,
-            lines=[ImportedPurchaseLine(**l) for l in lines],
-            unmatched_items=unmatched,
-        )
 
-    except Exception as exc:
-        record.status = "error"
-        record.error_message = str(exc)
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"Failed to parse file: {exc}")
+@router.get("/{import_id}/status")
+def get_import_status(import_id: int, db: Session = Depends(get_db)):
+    """Poll this until status is 'pending_review' or 'error'."""
+    record = db.query(ImportRecord).filter(ImportRecord.id == import_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Import not found")
+
+    result = {
+        "import_id": record.id,
+        "status": record.status,
+        "filename": record.filename,
+        "error_message": record.error_message,
+    }
+
+    if record.status == "pending_review" and record.extracted_data:
+        data = record.extracted_data
+        result["preview"] = {
+            "import_id": record.id,
+            "filename": record.filename,
+            "supplier_detected": data.get("supplier_detected"),
+            "date_range": data.get("date_range"),
+            "lines": data.get("lines", []),
+            "unmatched_items": data.get("unmatched_items", []),
+        }
+
+    return result
 
 
 @router.post("/confirm")
 def confirm_import(payload: ImportConfirm, db: Session = Depends(get_db)):
-    """Commit the reviewed import lines into inventory transactions."""
+    """Commit reviewed import lines into inventory transactions."""
     record = db.query(ImportRecord).filter(ImportRecord.id == payload.import_id).first()
     if not record:
         raise HTTPException(status_code=404, detail="Import record not found")
@@ -93,7 +125,6 @@ def confirm_import(payload: ImportConfirm, db: Session = Depends(get_db)):
 
         inv_item_id = line.matched_inventory_id
 
-        # Auto-create inventory item if needed
         if not inv_item_id and payload.create_missing_items and line.item_name:
             supplier = None
             if line.supplier:
@@ -136,7 +167,6 @@ def confirm_import(payload: ImportConfirm, db: Session = Depends(get_db)):
         )
         db.add(tx)
 
-        # Update current stock for historical data
         item = db.query(InventoryItem).filter(InventoryItem.id == inv_item_id).first()
         if item:
             item.current_stock += line.quantity

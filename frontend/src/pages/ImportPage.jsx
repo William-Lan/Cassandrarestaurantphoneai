@@ -1,8 +1,8 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { useDropzone } from 'react-dropzone'
-import { Upload, FileText, CheckCircle, AlertCircle, Loader, ChevronDown, ChevronUp } from 'lucide-react'
+import { Upload, CheckCircle, AlertCircle, Loader } from 'lucide-react'
 import { uploadImport, confirmImport, getImportHistory } from '../api/inventory'
-import { useEffect } from 'react'
+import api from '../api/client'
 
 function DropZone({ onFile }) {
   const onDrop = useCallback(files => files[0] && onFile(files[0]), [onFile])
@@ -42,9 +42,8 @@ function ImportPreviewTable({ preview, onConfirm, onCancel }) {
   const [createMissing, setCreateMissing] = useState(true)
   const [loading, setLoading] = useState(false)
 
-  const updateLine = (i, field, value) => {
+  const updateLine = (i, field, value) =>
     setLines(prev => prev.map((l, idx) => idx === i ? { ...l, [field]: value } : l))
-  }
 
   const handleConfirm = async () => {
     setLoading(true)
@@ -101,11 +100,9 @@ function ImportPreviewTable({ preview, onConfirm, onCancel }) {
                 <td className="px-4 py-2 text-gray-500">{line.supplier || '—'}</td>
                 <td className="px-4 py-2 text-gray-500">{line.date || '—'}</td>
                 <td className="px-4 py-2 text-center">
-                  {line.matched_inventory_id ? (
-                    <CheckCircle size={14} className="text-green-500 mx-auto" />
-                  ) : (
-                    <span className="text-xs text-amber-600">New</span>
-                  )}
+                  {line.matched_inventory_id
+                    ? <CheckCircle size={14} className="text-green-500 mx-auto" />
+                    : <span className="text-xs text-amber-600">New</span>}
                 </td>
               </tr>
             ))}
@@ -114,12 +111,7 @@ function ImportPreviewTable({ preview, onConfirm, onCancel }) {
       </div>
 
       <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
-        <input
-          type="checkbox"
-          checked={createMissing}
-          onChange={e => setCreateMissing(e.target.checked)}
-          className="rounded"
-        />
+        <input type="checkbox" checked={createMissing} onChange={e => setCreateMissing(e.target.checked)} className="rounded" />
         Automatically create new inventory items for unmatched products
       </label>
 
@@ -140,23 +132,63 @@ function ImportPreviewTable({ preview, onConfirm, onCancel }) {
   )
 }
 
+const POLL_INTERVAL_MS = 3000
+
 export default function ImportPage() {
-  const [state, setState] = useState('idle') // idle | uploading | preview | done | error
+  const [state, setState] = useState('idle') // idle | uploading | processing | preview | done | error
   const [preview, setPreview] = useState(null)
   const [error, setError] = useState('')
   const [history, setHistory] = useState([])
+  const [processingMsg, setProcessingMsg] = useState('')
+  const pollRef = useRef(null)
 
   const loadHistory = () => getImportHistory().then(r => setHistory(r.data)).catch(() => {})
-
   useEffect(() => { loadHistory() }, [])
+
+  // Stop polling on unmount
+  useEffect(() => () => clearInterval(pollRef.current), [])
+
+  const startPolling = (importId) => {
+    let attempts = 0
+    const msgs = [
+      'Claude is reading your file...',
+      'Extracting items and prices...',
+      'Matching to your inventory...',
+      'Almost done...',
+    ]
+    pollRef.current = setInterval(async () => {
+      attempts++
+      setProcessingMsg(msgs[Math.min(Math.floor(attempts / 3), msgs.length - 1)])
+      try {
+        const res = await api.get(`/import/${importId}/status`)
+        const { status, preview: previewData, error_message } = res.data
+
+        if (status === 'pending_review') {
+          clearInterval(pollRef.current)
+          setPreview(previewData)
+          setState('preview')
+        } else if (status === 'error') {
+          clearInterval(pollRef.current)
+          setError(error_message || 'Unknown error during processing')
+          setState('error')
+        }
+        // still 'processing' — keep polling
+      } catch {
+        clearInterval(pollRef.current)
+        setError('Lost connection while processing. Please try again.')
+        setState('error')
+      }
+    }, POLL_INTERVAL_MS)
+  }
 
   const handleFile = async (file) => {
     setState('uploading')
     setError('')
     try {
       const res = await uploadImport(file)
-      setPreview(res.data)
-      setState('preview')
+      const { import_id } = res.data
+      setState('processing')
+      startPolling(import_id)
     } catch (e) {
       setError(e.response?.data?.detail || e.message)
       setState('error')
@@ -182,8 +214,15 @@ export default function ImportPage() {
       {state === 'uploading' && (
         <div className="flex flex-col items-center py-16 gap-4 text-gray-500">
           <Loader size={36} className="animate-spin text-brand-500" />
-          <p className="font-medium">Claude is reading your file...</p>
-          <p className="text-sm">Extracting items, quantities, prices, and dates</p>
+          <p className="font-medium">Uploading file...</p>
+        </div>
+      )}
+
+      {state === 'processing' && (
+        <div className="flex flex-col items-center py-16 gap-4 text-gray-500">
+          <Loader size={36} className="animate-spin text-purple-500" />
+          <p className="font-medium">{processingMsg || 'Claude is reading your file...'}</p>
+          <p className="text-sm text-gray-400">Large files can take up to a minute — you can leave this page and come back</p>
         </div>
       )}
 
@@ -200,10 +239,7 @@ export default function ImportPage() {
           <CheckCircle size={36} className="text-green-500 mx-auto mb-3" />
           <h3 className="font-semibold text-green-800 text-lg">Import Complete</h3>
           <p className="text-sm text-green-700 mt-1">Your purchase history is now part of the AI's knowledge base.</p>
-          <button
-            onClick={() => setState('idle')}
-            className="mt-4 px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700"
-          >
+          <button onClick={() => setState('idle')} className="mt-4 px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700">
             Import Another File
           </button>
         </div>
@@ -216,13 +252,10 @@ export default function ImportPage() {
             Import Failed
           </div>
           <p className="text-sm text-red-600 mt-1">{error}</p>
-          <button onClick={() => setState('idle')} className="mt-3 text-sm text-red-700 underline">
-            Try again
-          </button>
+          <button onClick={() => setState('idle')} className="mt-3 text-sm text-red-700 underline">Try again</button>
         </div>
       )}
 
-      {/* History */}
       {history.length > 0 && (
         <div className="bg-white rounded-xl border border-gray-200 p-5">
           <h3 className="font-semibold text-gray-800 mb-3">Import History</h3>

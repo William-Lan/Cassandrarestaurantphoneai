@@ -168,11 +168,15 @@ If dates appear at the header level, apply them to all items."""
             {"type": "text", "text": "Extract all purchase line items from this document as JSON."},
         ]
     else:
-        # CSV/Excel — decode as text
+        # CSV/Excel — decode as text, cap at 2000 lines to avoid token limits
         try:
             text_content = file_bytes.decode("utf-8")
         except UnicodeDecodeError:
             text_content = file_bytes.decode("latin-1")
+        lines = text_content.splitlines()
+        if len(lines) > 2000:
+            text_content = "\n".join(lines[:2000])
+            text_content += f"\n[truncated — showing first 2000 of {len(lines)} rows]"
         content = [
             {
                 "type": "text",
