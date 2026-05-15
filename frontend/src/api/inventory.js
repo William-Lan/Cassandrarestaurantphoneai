@@ -31,6 +31,14 @@ export const uploadImport = (file) => {
 export const confirmImport = (data) => api.post('/import/confirm', data)
 export const getImportHistory = () => api.get('/import/history')
 
+export const uploadMenuImport = (file) => {
+  const form = new FormData()
+  form.append('file', file)
+  return api.post('/import/menu/upload', form, { headers: { 'Content-Type': 'multipart/form-data' } })
+}
+export const getMenuImportStatus = (id) => api.get(`/import/menu/${id}/status`)
+export const confirmMenuImport = (data) => api.post('/import/menu/confirm', data)
+
 export const getAISuggestions = () => api.get('/ai/reorder-suggestions')
 export const createOrderFromSuggestions = () => api.post('/ai/create-order-from-suggestions')
 

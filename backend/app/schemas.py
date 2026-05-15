@@ -215,6 +215,26 @@ class ImportConfirm(BaseModel):
     create_missing_items: bool = True
 
 
+# ── Menu import ───────────────────────────────────────────────────────────────
+
+class ExtractedMenuItem(BaseModel):
+    name: str
+    category: str = "General"
+    price: float = 0.0
+    description: Optional[str] = None
+    ingredients_hint: Optional[str] = None   # raw text from menu if listed
+
+class MenuImportPreview(BaseModel):
+    import_id: int
+    filename: str
+    items: List[ExtractedMenuItem]
+
+class MenuImportConfirm(BaseModel):
+    import_id: int
+    items: List[ExtractedMenuItem]
+    create_missing_items: bool = True
+
+
 # ── AI ────────────────────────────────────────────────────────────────────────
 
 class ReorderSuggestion(BaseModel):

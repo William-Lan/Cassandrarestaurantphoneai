@@ -373,6 +373,47 @@ Match inventory_id only when confident (allow abbreviations/brands). Otherwise n
     return lines, data_type
 
 
+# ── Menu file import ─────────────────────────────────────────────────────────
+
+def parse_menu_file(file_bytes: bytes, filename: str, mime_type: str) -> list[dict]:
+    """
+    Extract menu items from any format (PDF, image, CSV, text).
+    Returns list of {name, category, price, description, ingredients_hint}.
+    """
+    is_pdf   = mime_type == "application/pdf" or filename.lower().endswith(".pdf")
+    is_image = mime_type.startswith("image/") or filename.lower().endswith((".png", ".jpg", ".jpeg"))
+
+    system = """You extract menu items from restaurant menus.
+Return a JSON array only — no markdown. Each item:
+{"name":"<dish name>","category":"<section e.g. Starters|Mains|Seafood|Steaks|Sides|Desserts|Cocktails|Wine|Beer|NA Bev>","price":<number or 0>,"description":"<brief description or null>","ingredients_hint":"<raw ingredients text if listed on the menu, otherwise null>"}
+
+Rules:
+- Extract EVERY dish, drink, and item
+- Infer category from the menu section heading
+- price should be a number (no $ sign); use 0 if not shown
+- ingredients_hint captures any ingredient list printed on the menu (e.g. "wagyu, truffle butter, roasted garlic jus")"""
+
+    if is_pdf or is_image:
+        encoded    = base64.standard_b64encode(file_bytes).decode("utf-8")
+        media_type = mime_type if (is_image and mime_type.startswith("image/")) else "application/pdf"
+        content = [
+            {
+                "type": "document" if is_pdf else "image",
+                "source": {"type": "base64", "media_type": media_type, "data": encoded},
+            },
+            {"type": "text", "text": "Extract all menu items and return as JSON array."},
+        ]
+    else:
+        try:
+            text = file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            text = file_bytes.decode("latin-1")
+        content = [{"type": "text", "text": f"Menu file: {filename}\n\n{text}\n\nExtract all items as JSON array."}]
+
+    raw = _call(FAST_MODEL, system, [{"role": "user", "content": content}], max_tokens=8192)
+    return _parse_json(raw)
+
+
 # ── Reorder suggestions ───────────────────────────────────────────────────────
 
 def _build_inventory_context(db: Session) -> str:

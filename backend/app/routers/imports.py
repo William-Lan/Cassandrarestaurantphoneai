@@ -3,9 +3,9 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 
 from ..database import get_db, SessionLocal
-from ..models import ImportRecord, InventoryItem, InventoryTransaction, TransactionType, Supplier
-from ..schemas import ImportConfirm, ImportedPurchaseLine
-from ..services.ai_service import parse_and_match_file, DATA_TYPE_LABELS
+from ..models import ImportRecord, InventoryItem, InventoryTransaction, TransactionType, Supplier, MenuItem
+from ..schemas import ImportConfirm, ImportedPurchaseLine, MenuImportConfirm, ExtractedMenuItem
+from ..services.ai_service import parse_and_match_file, parse_menu_file, DATA_TYPE_LABELS
 
 router = APIRouter(prefix="/import", tags=["import"])
 
@@ -208,6 +208,102 @@ def confirm_import(payload: ImportConfirm, db: Session = Depends(get_db)):
     record.status        = "completed"
     db.commit()
     return {"imported": imported, "import_id": record.id, "status": "completed"}
+
+
+@router.post("/menu/upload")
+async def upload_menu_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Upload a menu (PDF, image, CSV). Claude extracts all dishes."""
+    content = await file.read()
+    if len(content) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=400, detail=f"File too large. Max 25MB.")
+
+    record = ImportRecord(
+        filename=file.filename,
+        file_type=file.content_type or "application/octet-stream",
+        status="processing",
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    background_tasks.add_task(
+        _process_menu_import, record.id, content,
+        file.filename, file.content_type or "application/octet-stream",
+    )
+    return {"import_id": record.id, "status": "processing", "filename": file.filename}
+
+
+def _process_menu_import(import_id: int, content: bytes, filename: str, mime_type: str):
+    db = SessionLocal()
+    try:
+        record = db.query(ImportRecord).filter(ImportRecord.id == import_id).first()
+        if not record:
+            return
+        try:
+            items = parse_menu_file(content, filename, mime_type)
+            record.rows_extracted = len(items)
+            record.extracted_data = {"menu_items": items, "data_type": "menu"}
+            record.status = "pending_review"
+        except Exception as exc:
+            record.status = "error"
+            record.error_message = str(exc)
+        db.commit()
+    finally:
+        db.close()
+
+
+@router.get("/menu/{import_id}/status")
+def get_menu_import_status(import_id: int, db: Session = Depends(get_db)):
+    record = db.query(ImportRecord).filter(ImportRecord.id == import_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Import not found")
+    result = {
+        "import_id":     record.id,
+        "status":        record.status,
+        "filename":      record.filename,
+        "error_message": record.error_message,
+    }
+    if record.status == "pending_review" and record.extracted_data:
+        result["preview"] = {
+            "import_id": record.id,
+            "filename":  record.filename,
+            "items":     record.extracted_data.get("menu_items", []),
+        }
+    return result
+
+
+@router.post("/menu/confirm")
+def confirm_menu_import(payload: MenuImportConfirm, db: Session = Depends(get_db)):
+    """Create MenuItem records from the reviewed extraction."""
+    record = db.query(ImportRecord).filter(ImportRecord.id == payload.import_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Import record not found")
+
+    created = skipped = 0
+    for item in payload.items:
+        if not item.name:
+            continue
+        # Skip exact duplicates
+        exists = db.query(MenuItem).filter(MenuItem.name == item.name).first()
+        if exists:
+            skipped += 1
+            continue
+        db.add(MenuItem(
+            name=item.name,
+            category=item.category or "General",
+            price=item.price or 0.0,
+            description=item.description,
+        ))
+        created += 1
+
+    record.rows_imported = created
+    record.status = "completed"
+    db.commit()
+    return {"created": created, "skipped": skipped, "import_id": record.id}
 
 
 @router.get("/history")
