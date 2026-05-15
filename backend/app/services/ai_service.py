@@ -144,10 +144,71 @@ Rules:
             text = file_bytes.decode("utf-8")
         except UnicodeDecodeError:
             text = file_bytes.decode("latin-1")
-        rows = text.splitlines()
-        if len(rows) > 1500:
-            text = "\n".join(rows[:1500]) + f"\n[truncated: {len(rows)} rows total]"
-        content = [{"type": "text", "text": f"File: {filename}\n\n{text}\n\nReturn JSON array."}]
+        text, is_sales = _preprocess_csv(text)
+        prompt_suffix = (
+            "This is aggregated sales/POS data. Treat quantities as items sold (usage), not purchased. "
+            "Set quantity to a NEGATIVE number (stock going out). Return JSON array."
+            if is_sales else
+            "Extract all purchase line items and match to inventory. Return JSON array."
+        )
+        content = [{"type": "text", "text": f"File: {filename}\n\n{text}\n\n{prompt_suffix}"}]
 
     raw = _call(system, [{"role": "user", "content": content}], max_tokens=8192)
     return _parse_json(raw)
+
+
+def _preprocess_csv(text: str) -> tuple[str, bool]:
+    """
+    Aggregate raw CSV before sending to Claude.
+    - POS/sales files (table_number, server_id, order_id columns): group by item, sum qty → ~50 rows
+    - Supplier invoices: trim to 500 rows (enough for any realistic invoice)
+    Returns (processed_text, is_sales_data).
+    """
+    import csv as csv_mod
+    from io import StringIO
+    from collections import defaultdict
+
+    try:
+        sample = text[:4000]
+        reader = csv_mod.DictReader(StringIO(sample))
+        headers = {h.lower().strip() for h in (reader.fieldnames or [])}
+    except Exception:
+        return text[:60000], False  # fallback: hard char limit
+
+    pos_signals = {"table_number", "table_no", "server_id", "server", "order_id",
+                   "check_number", "check_id", "ticket_number", "pos_id"}
+    is_sales = bool(headers & pos_signals)
+
+    if is_sales:
+        # Aggregate: sum quantities and revenue by item name
+        totals = defaultdict(lambda: {"quantity": 0.0, "revenue": 0.0, "dates": set()})
+        try:
+            for row in csv_mod.DictReader(StringIO(text)):
+                name = (row.get("item_name") or row.get("item") or row.get("product_name")
+                        or row.get("description") or "").strip()
+                qty  = float(row.get("quantity") or row.get("qty") or 1)
+                rev  = float(row.get("line_total") or row.get("total") or
+                             row.get("unit_price") or 0)
+                date = (row.get("order_date") or row.get("date") or
+                        row.get("order_datetime") or "")[:10]
+                if name:
+                    totals[name]["quantity"] += qty
+                    totals[name]["revenue"]  += rev
+                    if date:
+                        totals[name]["dates"].add(date)
+        except Exception:
+            pass
+
+        lines = ["item_name,total_qty_sold,total_revenue,date_range"]
+        for name, d in sorted(totals.items(), key=lambda x: -x[1]["quantity"]):
+            dates = sorted(d["dates"])
+            dr = f"{dates[0]} to {dates[-1]}" if len(dates) > 1 else (dates[0] if dates else "")
+            lines.append(f"{name},{d['quantity']:.0f},{d['revenue']:.2f},{dr}")
+        return "\n".join(lines), True
+
+    else:
+        # Regular invoice/purchase file — just cap rows
+        rows = text.splitlines()
+        if len(rows) > 500:
+            text = "\n".join(rows[:500]) + f"\n[showing first 500 of {len(rows)} rows]"
+        return text, False
