@@ -195,10 +195,13 @@ class ImportedPurchaseLine(BaseModel):
     date: Optional[str] = None
     matched_inventory_id: Optional[int] = None
     confidence: float = 0.0
+    transaction_type: Optional[str] = None   # purchase | usage | adjustment
 
 class ImportPreview(BaseModel):
     import_id: int
     filename: str
+    data_type: str                            # supplier_invoice | pos_sales | inventory_count
+    data_type_label: str
     supplier_detected: Optional[str]
     date_range: Optional[str]
     lines: List[ImportedPurchaseLine]

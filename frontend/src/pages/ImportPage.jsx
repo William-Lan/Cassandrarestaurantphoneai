@@ -37,6 +37,27 @@ function DropZone({ onFile }) {
   )
 }
 
+const DATA_TYPE_CONFIG = {
+  supplier_invoice: {
+    icon: '🧾',
+    color: 'bg-green-50 border-green-200 text-green-800',
+    badge: 'bg-green-100 text-green-700',
+    description: 'Stock will increase. Prices and supplier info recorded.',
+  },
+  pos_sales: {
+    icon: '📊',
+    color: 'bg-purple-50 border-purple-200 text-purple-800',
+    badge: 'bg-purple-100 text-purple-700',
+    description: 'Sales recorded as usage. AI reorder engine will learn consumption patterns and weekly trends.',
+  },
+  inventory_count: {
+    icon: '📋',
+    color: 'bg-blue-50 border-blue-200 text-blue-800',
+    badge: 'bg-blue-100 text-blue-700',
+    description: 'Stock levels will be SET to the counted values. Use this after a physical stock take.',
+  },
+}
+
 function ImportPreviewTable({ preview, onConfirm, onCancel }) {
   const [lines, setLines] = useState(preview.lines)
   const [createMissing, setCreateMissing] = useState(true)
@@ -57,14 +78,27 @@ function ImportPreviewTable({ preview, onConfirm, onCancel }) {
     }
   }
 
+  const dtConfig = DATA_TYPE_CONFIG[preview.data_type] || DATA_TYPE_CONFIG.supplier_invoice
+
   return (
     <div className="space-y-4">
-      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm text-blue-800">
-        <strong>Claude extracted {preview.lines.length} items</strong> from {preview.filename}
-        {preview.supplier_detected && <span> · Supplier: <strong>{preview.supplier_detected}</strong></span>}
-        {preview.date_range && <span> · Dates: <strong>{preview.date_range}</strong></span>}
+      {/* File type banner */}
+      <div className={`border rounded-lg p-4 text-sm ${dtConfig.color}`}>
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-lg">{dtConfig.icon}</span>
+          <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${dtConfig.badge}`}>
+            {preview.data_type_label}
+          </span>
+          <span className="font-medium">{preview.filename}</span>
+        </div>
+        <p className="text-xs opacity-80 mt-1">{dtConfig.description}</p>
+        <div className="mt-1 text-xs opacity-70 flex gap-3">
+          {preview.supplier_detected && <span>Supplier: <strong>{preview.supplier_detected}</strong></span>}
+          {preview.date_range && <span>Dates: <strong>{preview.date_range}</strong></span>}
+          <span><strong>{preview.lines.length}</strong> items extracted</span>
+        </div>
         {preview.unmatched_items.length > 0 && (
-          <div className="mt-2 text-amber-700">
+          <div className="mt-2 text-amber-700 text-xs">
             <strong>{preview.unmatched_items.length} items</strong> not matched to existing inventory —
             {createMissing ? ' will be created automatically.' : ' will be skipped.'}
           </div>
@@ -260,22 +294,26 @@ export default function ImportPage() {
         <div className="bg-white rounded-xl border border-gray-200 p-5">
           <h3 className="font-semibold text-gray-800 mb-3">Import History</h3>
           <div className="space-y-2">
-            {history.map(imp => (
-              <div key={imp.id} className="flex items-center justify-between text-sm py-1">
-                <div>
-                  <span className="text-gray-800 font-medium">{imp.filename}</span>
-                  {imp.supplier_name && <span className="text-gray-400 ml-2">· {imp.supplier_name}</span>}
+            {history.map(imp => {
+              const cfg = DATA_TYPE_CONFIG[imp.data_type] || DATA_TYPE_CONFIG.supplier_invoice
+              return (
+                <div key={imp.id} className="flex items-center justify-between text-sm py-1">
+                  <div className="flex items-center gap-2">
+                    <span title={imp.data_type_label}>{cfg.icon}</span>
+                    <span className="text-gray-800 font-medium">{imp.filename}</span>
+                    {imp.supplier_name && <span className="text-gray-400">· {imp.supplier_name}</span>}
+                  </div>
+                  <div className="flex items-center gap-4 text-xs text-gray-400">
+                    <span>{imp.rows_imported}/{imp.rows_extracted} items</span>
+                    <span className={
+                      imp.status === 'completed' ? 'text-green-600' :
+                      imp.status === 'error' ? 'text-red-500' : 'text-gray-400'
+                    }>{imp.status}</span>
+                    <span>{new Date(imp.created_at).toLocaleDateString()}</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-4 text-xs text-gray-400">
-                  <span>{imp.rows_imported}/{imp.rows_extracted} items</span>
-                  <span className={
-                    imp.status === 'completed' ? 'text-green-600' :
-                    imp.status === 'error' ? 'text-red-500' : 'text-gray-400'
-                  }>{imp.status}</span>
-                  <span>{new Date(imp.created_at).toLocaleDateString()}</span>
-                </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </div>
       )}
