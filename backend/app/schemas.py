@@ -196,6 +196,8 @@ class ImportedPurchaseLine(BaseModel):
     matched_inventory_id: Optional[int] = None
     confidence: float = 0.0
     transaction_type: Optional[str] = None   # purchase | usage | adjustment
+    source_menu_item: Optional[str] = None   # which menu item drove this ingredient usage
+    servings_sold: Optional[float] = None    # servings sold of that menu item
 
 class ImportPreview(BaseModel):
     import_id: int

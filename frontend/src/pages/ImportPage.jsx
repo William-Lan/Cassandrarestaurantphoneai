@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { useDropzone } from 'react-dropzone'
 import { Upload, CheckCircle, AlertCircle, Loader } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { uploadImport, confirmImport, getImportHistory } from '../api/inventory'
 import api from '../api/client'
 
@@ -33,6 +34,115 @@ function DropZone({ onFile }) {
       <button className="mt-4 px-4 py-2 bg-brand-600 text-white text-sm rounded-lg hover:bg-brand-700">
         Or click to browse files
       </button>
+    </div>
+  )
+}
+
+// Group ingredient usage lines by the menu item that caused them
+function POSSalesPreview({ lines, preview }) {
+  const grouped = {}
+  const direct  = []
+
+  for (const line of lines) {
+    if (line.source_menu_item) {
+      if (!grouped[line.source_menu_item]) {
+        grouped[line.source_menu_item] = { servings: line.servings_sold, ingredients: [] }
+      }
+      grouped[line.source_menu_item].ingredients.push(line)
+    } else {
+      direct.push(line)
+    }
+  }
+
+  const needsSetup = preview.needs_menu_setup || []
+
+  return (
+    <div className="space-y-3">
+      {/* Items expanded via menu recipe */}
+      {Object.entries(grouped).map(([menuItem, { servings, ingredients }]) => (
+        <div key={menuItem} className="border border-gray-200 rounded-lg overflow-hidden">
+          <div className="bg-gray-50 px-4 py-2 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-gray-700">{menuItem}</span>
+              <span className="text-xs text-gray-400">× {servings} sold</span>
+            </div>
+            <span className="text-xs text-green-600 font-medium">✓ recipe matched</span>
+          </div>
+          <table className="w-full text-sm">
+            <thead className="text-xs text-gray-400 uppercase">
+              <tr>
+                <th className="px-4 py-1.5 text-left">Ingredient</th>
+                <th className="px-4 py-1.5 text-right">Per serving</th>
+                <th className="px-4 py-1.5 text-right">Total used</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {ingredients.map((ing, i) => {
+                const perServing = ing.servings_sold > 0 ? Math.abs(ing.quantity) / ing.servings_sold : 0
+                return (
+                  <tr key={i} className="bg-white">
+                    <td className="px-4 py-1.5 text-gray-800">{ing.item_name}</td>
+                    <td className="px-4 py-1.5 text-right text-gray-500">{perServing.toFixed(2)} {ing.unit}</td>
+                    <td className="px-4 py-1.5 text-right font-mono text-red-600">
+                      −{Math.abs(ing.quantity).toFixed(1)} {ing.unit}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      ))}
+
+      {/* Direct inventory matches (simple items with no recipe needed) */}
+      {direct.length > 0 && (
+        <div className="border border-gray-200 rounded-lg overflow-hidden">
+          <div className="bg-gray-50 px-4 py-2">
+            <span className="text-xs font-semibold text-gray-700">Direct inventory items</span>
+          </div>
+          <table className="w-full text-sm">
+            <tbody className="divide-y divide-gray-100">
+              {direct.map((line, i) => (
+                <tr key={i} className={line.matched_inventory_id ? 'bg-white' : 'bg-amber-50'}>
+                  <td className="px-4 py-2 text-gray-800">{line.item_name}</td>
+                  <td className="px-4 py-2 text-right font-mono text-red-600">
+                    −{Math.abs(line.quantity).toFixed(1)} {line.unit || ''}
+                  </td>
+                  <td className="px-4 py-2 text-center">
+                    {line.matched_inventory_id
+                      ? <CheckCircle size={13} className="text-green-500 mx-auto" />
+                      : <span className="text-xs text-amber-600">Unmatched</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Items that need menu setup */}
+      {needsSetup.length > 0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm">
+          <p className="font-medium text-amber-800 mb-1">
+            {needsSetup.length} item{needsSetup.length > 1 ? 's' : ''} skipped — no menu recipe set up:
+          </p>
+          <p className="text-xs text-amber-700 mb-2">{needsSetup.join(', ')}</p>
+          <Link to="/menu" className="text-xs text-amber-800 underline font-medium">
+            Go to Menu → add these dishes with their ingredients →
+          </Link>
+          <span className="text-xs text-amber-600 ml-1">then re-import this file</span>
+        </div>
+      )}
+
+      {lines.length === 0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-6 text-center text-amber-800 text-sm">
+          <p className="font-medium mb-1">No ingredient usage could be calculated</p>
+          <p className="text-xs">Your menu items haven't been set up with ingredients yet.</p>
+          <Link to="/menu" className="text-xs underline font-medium mt-2 block">
+            Go to Menu → add your dishes with their ingredients →
+          </Link>
+        </div>
+      )}
     </div>
   )
 }
@@ -105,44 +215,49 @@ function ImportPreviewTable({ preview, onConfirm, onCancel }) {
         )}
       </div>
 
-      <div className="overflow-x-auto rounded-lg border border-gray-200">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 text-gray-600 text-xs uppercase">
-            <tr>
-              <th className="px-4 py-3 text-left">Item</th>
-              <th className="px-4 py-3 text-right">Qty</th>
-              <th className="px-4 py-3 text-left">Unit</th>
-              <th className="px-4 py-3 text-right">Unit Cost</th>
-              <th className="px-4 py-3 text-left">Supplier</th>
-              <th className="px-4 py-3 text-left">Date</th>
-              <th className="px-4 py-3 text-center">Match</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {lines.map((line, i) => (
-              <tr key={i} className={line.matched_inventory_id ? '' : 'bg-amber-50'}>
-                <td className="px-4 py-2">
-                  <input
-                    className="border-0 bg-transparent w-full focus:outline-none focus:ring-1 focus:ring-blue-300 rounded px-1"
-                    value={line.item_name}
-                    onChange={e => updateLine(i, 'item_name', e.target.value)}
-                  />
-                </td>
-                <td className="px-4 py-2 text-right">{line.quantity}</td>
-                <td className="px-4 py-2">{line.unit || '—'}</td>
-                <td className="px-4 py-2 text-right">{line.unit_cost ? `$${line.unit_cost.toFixed(2)}` : '—'}</td>
-                <td className="px-4 py-2 text-gray-500">{line.supplier || '—'}</td>
-                <td className="px-4 py-2 text-gray-500">{line.date || '—'}</td>
-                <td className="px-4 py-2 text-center">
-                  {line.matched_inventory_id
-                    ? <CheckCircle size={14} className="text-green-500 mx-auto" />
-                    : <span className="text-xs text-amber-600">New</span>}
-                </td>
+      {/* POS data: show grouped by source menu item */}
+      {preview.data_type === 'pos_sales' ? (
+        <POSSalesPreview lines={lines} preview={preview} />
+      ) : (
+        <div className="overflow-x-auto rounded-lg border border-gray-200">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-600 text-xs uppercase">
+              <tr>
+                <th className="px-4 py-3 text-left">Item</th>
+                <th className="px-4 py-3 text-right">Qty</th>
+                <th className="px-4 py-3 text-left">Unit</th>
+                <th className="px-4 py-3 text-right">Unit Cost</th>
+                <th className="px-4 py-3 text-left">Supplier</th>
+                <th className="px-4 py-3 text-left">Date</th>
+                <th className="px-4 py-3 text-center">Match</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {lines.map((line, i) => (
+                <tr key={i} className={line.matched_inventory_id ? '' : 'bg-amber-50'}>
+                  <td className="px-4 py-2">
+                    <input
+                      className="border-0 bg-transparent w-full focus:outline-none focus:ring-1 focus:ring-blue-300 rounded px-1"
+                      value={line.item_name}
+                      onChange={e => updateLine(i, 'item_name', e.target.value)}
+                    />
+                  </td>
+                  <td className="px-4 py-2 text-right">{line.quantity}</td>
+                  <td className="px-4 py-2">{line.unit || '—'}</td>
+                  <td className="px-4 py-2 text-right">{line.unit_cost ? `$${line.unit_cost.toFixed(2)}` : '—'}</td>
+                  <td className="px-4 py-2 text-gray-500">{line.supplier || '—'}</td>
+                  <td className="px-4 py-2 text-gray-500">{line.date || '—'}</td>
+                  <td className="px-4 py-2 text-center">
+                    {line.matched_inventory_id
+                      ? <CheckCircle size={14} className="text-green-500 mx-auto" />
+                      : <span className="text-xs text-amber-600">New</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
         <input type="checkbox" checked={createMissing} onChange={e => setCreateMissing(e.target.checked)} className="rounded" />

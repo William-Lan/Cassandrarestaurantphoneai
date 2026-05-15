@@ -63,6 +63,17 @@ def _process_import(import_id: int, content: bytes, filename: str, mime_type: st
                 f"{dates[0]} — {dates[-1]}" if len(dates) > 1 else (dates[0] if dates else None)
             )
 
+            # For POS data, flag items with no menu item set up so the user knows to add them
+            needs_menu_setup = []
+            if data_type == "pos_sales":
+                seen_menu_items = {l.get("source_menu_item") for l in lines if l.get("source_menu_item")}
+                # Items that came back from direct inventory matching have no source_menu_item
+                # Items with no match at all simply aren't in the results — collect from warnings
+                needs_menu_setup = list({
+                    l["item_name"] for l in lines
+                    if not l.get("matched_inventory_id") and not l.get("source_menu_item")
+                })
+
             record.rows_extracted = len(lines)
             record.supplier_name  = suppliers[0] if suppliers else None
             record.extracted_data = {
@@ -71,6 +82,7 @@ def _process_import(import_id: int, content: bytes, filename: str, mime_type: st
                 "supplier_detected": suppliers[0] if suppliers else None,
                 "date_range":        date_range,
                 "unmatched_items":  [l["item_name"] for l in lines if not l.get("matched_inventory_id")],
+                "needs_menu_setup": needs_menu_setup,
             }
             record.status = "pending_review"
         except Exception as exc:
@@ -106,6 +118,7 @@ def get_import_status(import_id: int, db: Session = Depends(get_db)):
             "date_range":        d.get("date_range"),
             "lines":             d.get("lines", []),
             "unmatched_items":   d.get("unmatched_items", []),
+            "needs_menu_setup":  d.get("needs_menu_setup", []),
         }
     return result
 

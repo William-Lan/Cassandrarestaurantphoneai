@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import time
@@ -9,11 +10,14 @@ from datetime import datetime, timedelta
 import anthropic
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
-from ..models import InventoryItem, InventoryTransaction, TransactionType
+from ..models import (
+    InventoryItem, InventoryTransaction, TransactionType,
+    MenuItem, MenuItemIngredient,
+)
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), max_retries=2)
-FAST_MODEL   = "claude-haiku-4-5-20251001"   # file parsing — cheap & fast
-SMART_MODEL  = "claude-sonnet-4-6"            # reorder suggestions — needs reasoning
+FAST_MODEL  = "claude-haiku-4-5-20251001"
+SMART_MODEL = "claude-sonnet-4-6"
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -42,13 +46,23 @@ def _call(model: str, system: str, messages: list, max_tokens: int = 4096) -> st
                 raise
 
 
+def _normalize(s: str) -> str:
+    """Lowercase, strip punctuation/sizes for fuzzy name matching."""
+    s = s.lower().strip()
+    # Remove common size suffixes like "6oz", "22oz", "8oz" for broader matching
+    s = re.sub(r'\b\d+\s*oz\b', '', s)
+    s = re.sub(r'\b\d+\s*g\b', '', s)
+    return re.sub(r'[^a-z0-9 ]', '', s).strip()
+
+
 # ── CSV type detection & preprocessing ───────────────────────────────────────
 
 DATA_TYPE_LABELS = {
-    "pos_sales":       "POS / Sales Data",
-    "inventory_count": "Monthly Inventory Count",
+    "pos_sales":        "POS / Sales Data",
+    "inventory_count":  "Monthly Inventory Count",
     "supplier_invoice": "Supplier Invoice / Purchase Order",
 }
+
 
 def _detect_csv_type(headers: set) -> str:
     pos_signals = {
@@ -70,10 +84,7 @@ def _detect_csv_type(headers: set) -> str:
 
 
 def _preprocess_csv(text: str) -> tuple[str, str]:
-    """
-    Detect file type and preprocess CSV before sending to Claude.
-    Returns (condensed_text, data_type).
-    """
+    """Detect file type and condense CSV. Returns (processed_text, data_type)."""
     try:
         reader = csv_mod.DictReader(StringIO(text[:8000]))
         headers = {(h or "").lower().strip() for h in (reader.fieldnames or [])}
@@ -83,7 +94,6 @@ def _preprocess_csv(text: str) -> tuple[str, str]:
     data_type = _detect_csv_type(headers)
 
     if data_type == "pos_sales":
-        # Aggregate by menu item — 6000 rows → ~60 rows
         totals: dict = defaultdict(lambda: {"quantity": 0.0, "revenue": 0.0, "dates": set()})
         try:
             for row in csv_mod.DictReader(StringIO(text)):
@@ -101,7 +111,6 @@ def _preprocess_csv(text: str) -> tuple[str, str]:
                         totals[name]["dates"].add(date)
         except Exception:
             pass
-
         lines = ["item_name,total_qty_sold,total_revenue,date_range"]
         for name, d in sorted(totals.items(), key=lambda x: -x[1]["quantity"]):
             dates = sorted(d["dates"])
@@ -110,36 +119,169 @@ def _preprocess_csv(text: str) -> tuple[str, str]:
         return "\n".join(lines), "pos_sales"
 
     elif data_type == "inventory_count":
-        # Usually already compact — just cap rows
         rows = text.splitlines()
         if len(rows) > 300:
             text = "\n".join(rows[:300]) + f"\n[showing 300 of {len(rows)} rows]"
         return text, "inventory_count"
 
     else:
-        # Supplier invoice — cap rows
         rows = text.splitlines()
         if len(rows) > 500:
             text = "\n".join(rows[:500]) + f"\n[showing 500 of {len(rows)} rows]"
         return text, "supplier_invoice"
 
 
-# ── File import — single combined Claude call ─────────────────────────────────
+# ── POS → menu item → ingredient expansion (no AI tokens needed) ─────────────
+
+def _expand_pos_via_menu(aggregated_csv: str, db: Session) -> tuple[list[dict], list[dict]]:
+    """
+    Parse aggregated POS sales and expand via menu item → ingredient mappings.
+
+    Returns:
+      expanded  — ingredient-level usage lines ready to import
+      unmatched — POS items with no menu item match (passed to Claude fallback)
+    """
+    # Parse the aggregated CSV back to dicts
+    sales = []
+    try:
+        for row in csv_mod.DictReader(StringIO(aggregated_csv)):
+            name     = row.get("item_name", "").strip()
+            qty_sold = float(row.get("total_qty_sold") or 0)
+            date_range = row.get("date_range", "")
+            # Use end date of range for the transaction date
+            date = date_range.split(" to ")[-1][:10] if " to " in date_range else date_range[:10]
+            if name and qty_sold > 0:
+                sales.append({"name": name, "qty_sold": qty_sold, "date": date})
+    except Exception:
+        return [], []
+
+    # Load all active menu items with their ingredient links
+    menu_items = (
+        db.query(MenuItem)
+        .filter(MenuItem.is_active == True)
+        .all()
+    )
+    menu_by_norm = {_normalize(m.name): m for m in menu_items}
+
+    expanded  = []
+    unmatched = []
+
+    for sale in sales:
+        norm      = _normalize(sale["name"])
+        menu_item = menu_by_norm.get(norm)
+
+        # Fuzzy fallback: one name contained in the other
+        if not menu_item:
+            for mn, mi in menu_by_norm.items():
+                if mn and norm and (mn in norm or norm in mn):
+                    menu_item = mi
+                    break
+
+        if menu_item:
+            # Load ingredients for this menu item
+            ingredient_links = (
+                db.query(MenuItemIngredient)
+                .filter(MenuItemIngredient.menu_item_id == menu_item.id)
+                .all()
+            )
+
+            if ingredient_links:
+                for link in ingredient_links:
+                    inv = db.query(InventoryItem).filter(
+                        InventoryItem.id == link.inventory_item_id
+                    ).first()
+                    if not inv:
+                        continue
+                    usage = sale["qty_sold"] * link.quantity_per_serving
+                    expanded.append({
+                        "item_name":           inv.name,
+                        "quantity":            -usage,          # negative = stock out
+                        "unit":                inv.unit,
+                        "unit_cost":           None,
+                        "total_cost":          None,
+                        "supplier":            None,
+                        "date":                sale["date"],
+                        "confidence":          0.95,
+                        "matched_inventory_id": inv.id,
+                        "transaction_type":    "usage",
+                        "source_menu_item":    menu_item.name,
+                        "servings_sold":       sale["qty_sold"],
+                    })
+            else:
+                # Menu item exists but no ingredients set up yet
+                unmatched.append({
+                    **sale,
+                    "_reason": f"Menu item '{menu_item.name}' has no ingredients — add them in Menu settings",
+                })
+        else:
+            unmatched.append({**sale, "_reason": "No matching menu item"})
+
+    return expanded, unmatched
+
+
+def _match_unmatched_pos_to_inventory(unmatched: list[dict], db: Session) -> list[dict]:
+    """
+    For POS items with no menu match, use Claude to try direct inventory matching.
+    These are typically simple items (bottled water, bread basket) that are
+    tracked directly in inventory without a recipe.
+    """
+    inventory_items = db.query(InventoryItem).filter(InventoryItem.is_active == True).all()
+    if not inventory_items or not unmatched:
+        return []
+
+    inv_list = "\n".join(f"{i.id}:{i.name}({i.unit})" for i in inventory_items[:300])
+    sales_list = json.dumps([{"item_name": u["name"], "qty_sold": u["qty_sold"]} for u in unmatched], indent=2)
+
+    system = f"""Match POS sales items to raw inventory (for items sold directly without a recipe).
+Existing inventory: {inv_list}
+
+Return JSON array — one entry per input item:
+{{"item_name":"<original name>","matched_inventory_id":<id or null>,"confidence":<0-1>}}
+
+Only match when confident it's the same product. Most items won't match (they need menu setup)."""
+
+    try:
+        raw = _call(
+            FAST_MODEL, system,
+            [{"role": "user", "content": f"POS items:\n{sales_list}\nReturn matches."}],
+            max_tokens=1024,
+        )
+        matches = {m["item_name"]: m.get("matched_inventory_id") for m in _parse_json(raw)}
+    except Exception:
+        matches = {}
+
+    result = []
+    for sale in unmatched:
+        inv_id = matches.get(sale["name"])
+        if inv_id:
+            inv = db.query(InventoryItem).filter(InventoryItem.id == inv_id).first()
+            result.append({
+                "item_name":           sale["name"],
+                "quantity":            -sale["qty_sold"],
+                "unit":                inv.unit if inv else "unit",
+                "unit_cost":           None,
+                "total_cost":          None,
+                "supplier":            None,
+                "date":                sale.get("date"),
+                "confidence":          0.7,
+                "matched_inventory_id": inv_id,
+                "transaction_type":    "usage",
+                "source_menu_item":    None,
+                "servings_sold":       sale["qty_sold"],
+            })
+        # Items with no match are dropped — user must set up menu items first
+    return result
+
+
+# ── File import — main entry point ────────────────────────────────────────────
 
 _TYPE_INSTRUCTIONS = {
-    "pos_sales": (
-        "This is aggregated POS/sales data showing menu items sold to customers.\n"
-        "- Set transaction_type = \"usage\" on every line\n"
-        "- Set quantity to a NEGATIVE number (stock leaving the kitchen)\n"
-        "- unit_cost and supplier should be null\n"
-        "- date should be the end of the reported period"
-    ),
     "inventory_count": (
         "This is a physical inventory count / monthly stock take.\n"
         "- Set transaction_type = \"adjustment\" on every line\n"
-        "- quantity = the COUNTED amount currently on hand (positive)\n"
-        "- This will overwrite the current stock level to the counted value\n"
-        "- unit_cost and supplier can be filled if present, otherwise null"
+        "- quantity = the COUNTED amount on hand (positive)\n"
+        "- This will SET the stock level to the counted value\n"
+        "- Fill unit_cost if present, otherwise null"
     ),
     "supplier_invoice": (
         "This is a supplier invoice or purchase order.\n"
@@ -154,9 +296,41 @@ def parse_and_match_file(
     file_bytes: bytes, filename: str, mime_type: str, db: Session
 ) -> tuple[list[dict], str]:
     """
-    Single Claude call: detect file type, extract lines, match to inventory.
+    Detect file type, extract lines, match/expand to inventory.
+    POS sales:        Python menu→ingredient expansion (no AI unless unmatched items)
+    Inventory count:  Claude extraction + inventory matching
+    Supplier invoice: Claude extraction + inventory matching
     Returns (lines, data_type).
     """
+    is_pdf   = mime_type == "application/pdf" or filename.lower().endswith(".pdf")
+    is_image = mime_type.startswith("image/") or filename.lower().endswith((".png", ".jpg", ".jpeg"))
+
+    if is_pdf or is_image:
+        # PDFs/images are almost always supplier invoices
+        data_type = "supplier_invoice"
+    else:
+        try:
+            raw_text = file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raw_text = file_bytes.decode("latin-1")
+        _, data_type = _preprocess_csv(raw_text)
+
+    # ── POS sales: expand via menu items (no AI for matched items) ────────────
+    if data_type == "pos_sales":
+        aggregated_csv, _ = _preprocess_csv(raw_text)
+        expanded, unmatched = _expand_pos_via_menu(aggregated_csv, db)
+
+        # For unmatched items, try direct inventory match via Claude
+        direct_matches = _match_unmatched_pos_to_inventory(unmatched, db)
+        all_lines = expanded + direct_matches
+
+        # If nothing matched at all, return a helpful placeholder
+        if not all_lines:
+            return [], data_type
+
+        return all_lines, data_type
+
+    # ── Inventory count & supplier invoice: Claude extraction ─────────────────
     inventory_items = db.query(InventoryItem).filter(InventoryItem.is_active == True).all()
     inv_section = (
         "Existing inventory (id:name(unit)):\n" +
@@ -164,12 +338,7 @@ def parse_and_match_file(
         if inventory_items else "Existing inventory: none yet."
     )
 
-    is_pdf   = mime_type == "application/pdf" or filename.lower().endswith(".pdf")
-    is_image = mime_type.startswith("image/") or filename.lower().endswith((".png", ".jpg", ".jpeg"))
-
     if is_pdf or is_image:
-        data_type = "supplier_invoice"   # PDFs are almost always invoices/receipts
-        type_instructions = _TYPE_INSTRUCTIONS[data_type]
         encoded    = base64.standard_b64encode(file_bytes).decode("utf-8")
         media_type = mime_type if (is_image and mime_type.startswith("image/")) else "application/pdf"
         content = [
@@ -177,34 +346,28 @@ def parse_and_match_file(
                 "type": "document" if is_pdf else "image",
                 "source": {"type": "base64", "media_type": media_type, "data": encoded},
             },
-            {"type": "text", "text": "Extract all purchase line items, match to inventory, return JSON array."},
+            {"type": "text", "text": "Extract all line items, match to inventory, return JSON array."},
         ]
     else:
-        try:
-            raw_text = file_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            raw_text = file_bytes.decode("latin-1")
-        processed_text, data_type = _preprocess_csv(raw_text)
-        type_instructions = _TYPE_INSTRUCTIONS[data_type]
-        content = [{"type": "text", "text": f"File: {filename}\n\n{processed_text}\n\nExtract items, match to inventory, return JSON array."}]
+        processed_text, _ = _preprocess_csv(raw_text)
+        content = [{"type": "text", "text": f"File: {filename}\n\n{processed_text}\n\nReturn JSON array."}]
 
+    type_instructions = _TYPE_INSTRUCTIONS[data_type]
     system = f"""{inv_section}
 
 {type_instructions}
 
-Return a JSON array only — no markdown. Each element must have exactly these fields:
-{{"item_name":"<str>","quantity":<number>,"unit":"<str|null>","unit_cost":<number|null>,"total_cost":<number|null>,"supplier":"<str|null>","date":"<YYYY-MM-DD|null>","confidence":<0-1>,"matched_inventory_id":<id|null>,"transaction_type":"<purchase|usage|adjustment|historical_import>"}}
+Return a JSON array only — no markdown. Each element:
+{{"item_name":"<str>","quantity":<number>,"unit":"<str|null>","unit_cost":<number|null>,"total_cost":<number|null>,"supplier":"<str|null>","date":"<YYYY-MM-DD|null>","confidence":<0-1>,"matched_inventory_id":<id|null>,"transaction_type":"<historical_import|adjustment>"}}
 
-Matching rule: set matched_inventory_id only when you are confident it is the same product (allow abbreviations/brand variants). Otherwise null."""
+Match inventory_id only when confident (allow abbreviations/brands). Otherwise null."""
 
-    raw = _call(FAST_MODEL, system, [{"role": "user", "content": content}], max_tokens=8192)
+    raw   = _call(FAST_MODEL, system, [{"role": "user", "content": content}], max_tokens=8192)
     lines = _parse_json(raw)
 
-    # Enforce correct quantity sign per type
+    # Enforce sign
     for line in lines:
-        if data_type == "pos_sales" and line.get("quantity", 0) > 0:
-            line["quantity"] = -abs(line["quantity"])
-        elif data_type in ("inventory_count", "supplier_invoice") and line.get("quantity", 0) < 0:
+        if data_type == "inventory_count" and line.get("quantity", 0) < 0:
             line["quantity"] = abs(line["quantity"])
 
     return lines, data_type
@@ -229,8 +392,7 @@ def _build_inventory_context(db: Session) -> str:
                 ]),
             )
             .order_by(desc(InventoryTransaction.transaction_date))
-            .limit(10)
-            .all()
+            .limit(10).all()
         )
 
         def usage_sum(since):
@@ -246,12 +408,9 @@ def _build_inventory_context(db: Session) -> str:
 
         use7  = usage_sum(ago7)
         use30 = usage_sum(ago30)
-
-        # Trend: compare last-7-day rate vs 30-day average rate
         weekly_avg = use30 / 4.0
         if weekly_avg > 0:
-            trend_pct = (use7 - weekly_avg) / weekly_avg * 100
-            trend = f"{trend_pct:+.0f}%"
+            trend = f"{(use7 - weekly_avg) / weekly_avg * 100:+.0f}%"
         else:
             trend = "no data"
 
@@ -268,7 +427,7 @@ def _build_inventory_context(db: Session) -> str:
         lines.append(
             f"{item.name}(id={item.id},stock={item.current_stock}{item.unit},"
             f"min={item.min_stock},cost=${item.cost_per_unit:.2f}{rule_info},"
-            f"use_7d={use7:.1f},use_30d={use30:.1f},trend_vs_avg={trend},"
+            f"use_7d={use7:.1f},use_30d={use30:.1f},trend={trend},"
             f"purchases=[{purchases_str}])"
         )
     return "\n".join(lines)
@@ -281,12 +440,12 @@ def get_reorder_suggestions(db: Session) -> dict:
     system = """You are a restaurant inventory AI. Analyze stock and recent sales trends to suggest reorders.
 
 Key rules:
-- use_7d = units consumed in the last 7 days; use_30d = last 30 days
-- trend_vs_avg compares last week to the average week over the last month
-  → positive trend (e.g. +40%) means sales are UP recently → order more / sooner
-  → negative trend (e.g. -30%) means sales are DOWN → may not need to reorder yet
+- use_7d = ingredient units consumed last 7 days (derived from actual dish sales via recipes)
+- use_30d = last 30 days; trend compares last week to the 30-day weekly average
+- Positive trend (e.g. +40%) = selling MORE than usual → order sooner / order more
+- Negative trend (e.g. -30%) = selling LESS than usual → may not need to reorder yet
 - Respect manual rules (min, reorder_qty, lead days) when present
-- urgency: critical=out of stock or <1 day, high=<3 days, medium=<7 days, low=approaching min
+- urgency: critical=out/≤1 day, high=≤3 days, medium=≤7 days, low=approaching min
 
 Respond with valid JSON only:
 {"summary":"<str>","suggestions":[{"inventory_item_id":<int>,"item_name":"<str>","current_stock":<float>,"unit":"<str>","suggested_quantity":<float>,"estimated_cost":<float>,"urgency":"critical|high|medium|low","reason":"<str>","days_until_stockout":<int|null>}]}"""
